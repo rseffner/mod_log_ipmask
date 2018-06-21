@@ -3,13 +3,16 @@
  * mod_log_ipmask - An Apache http server modul extending mod_log_config
  *					to masquerade Client IP-Addresses in logfiles
  *
- * Copyright (C) 2008 Mario Oßwald, 
+ * Copyright (C) 2008 Mario Osswald, 
  *					  Referatsleiter "Technik, Informatik, Medien"
  *					  beim
- *					  Sächsischen Datenschutzbeauftragten
+ *					  Saechsischen Datenschutzbeauftragten
  *
  * Author			  Florian van Koten
  *					  systematics NETWORK SERVICES GmbH
+ *
+ * ...with modifications (C) 2012 Peter Conrad
+ * ...IPv6 patch adapted to apache2.4 (C) 2017 Ronny Seffner
  * -----------------------------------------------------------------------------
  * 
  * This program is free software; you can redistribute it and/or modify
@@ -27,16 +30,23 @@
  * -----------------------------------------------------------------------------
 */
 
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <string.h>
 #include "httpd.h"
 #include "http_config.h"
-#include "http_core.h"          /* Für REMOTE_NAME */
+#include "http_core.h"          /* Fuer REMOTE_NAME */
 #include "mod_log_config.h"
 
 
 #ifndef DEFAULT_FILTER_MASK
 #define DEFAULT_FILTER_MASK "255.255.255.0"
 #endif
+#define DEFAULT_FILTER_BITS_V4 24
+#define DEFAULT_FILTER_BITS_V6 56
 
+static const char *V4_PFX = "\0\0\0\0\0\0\0\0\0\0\377\377";
 
 struct apr_ipsubnet_t {
     int family;
@@ -55,44 +65,25 @@ struct apr_ipsubnet_t {
  */
 module AP_MODULE_DECLARE_DATA log_ipmask_module;
 
+static const int BUFLEN = 48;
 
-/**
-* @see inet_ntop4
-*/
-static const char* ipmask_inet_ntop4(const unsigned char *src, char *dst)
-{
-	int n = 0;
-	char *next = dst;
-
-	do {
-	    unsigned char u = *src++;
-	    if (u > 99) {
-		*next++ = '0' + u/100;
-		u %= 100;
-		*next++ = '0' + u/10;
-		u %= 10;
-	    }
-	    else if (u > 9) {
-		*next++ = '0' + u/10;
-		u %= 10;
-	    }
-	    *next++ = '0' + u;
-	    *next++ = '.';
-	    n++;
-	} while (n < 4);
-	*--next = 0;
-	return dst;
+static char* to_string(struct sockaddr *sa, size_t salen, apr_pool_t* pPool) {
+	char *buf = apr_pcalloc(pPool, BUFLEN);
+	int rv;
+	if (!buf) { return NULL; }
+	rv = getnameinfo(sa, salen, buf, BUFLEN, NULL, 0, NI_NUMERICHOST);
+	if (rv) { *buf = 0; }
+	return buf;
 }
-
 
 /**
 * @brief	Maskiert eine IP-Adresse mit der angegebenen Filter-Maske.
-*			Die Filter-Maske kann entweder eine IP-Adresse
-*			(z.B. 255.255.255.0)
-*			oder die Anzahl der zu erhaltenen Bits sein
-*			(z.B. 24)
+*			Die Filter-Maske entspricht
+*			der Anzahl der zu erhaltenen Bits (z.B. 24)
+*			Die Maske kann durch einen '/' getrennt verschiedene
+*			Werte fuer IPv4 und IPv6 enthalten.
 *			Die Filtermaske wird in der Logger-Konfiguration angegeben;
-*			Beispiel %{24}h oder %{255.255.0.0}a
+*			Beispiel %{24}h oder %{24/56}a
 * @param	char*		pszAddress (IP-Adresse)
 * @param	char*		pszFilterMask (Filter-Maske)
 * @param	apr_pool_t*	pPool
@@ -100,43 +91,62 @@ static const char* ipmask_inet_ntop4(const unsigned char *src, char *dst)
 static const char* get_filtered_ip(char* pszAddress, char* pszFilterMask, apr_pool_t* pPool) {
 	char*			pszFilteredIP = NULL;
 	apr_status_t	rv;
-	apr_ipsubnet_t*	pIPSubNet;
+	int bitsv4, bitsv6;
+	struct addrinfo hints = {0}, *res = NULL;
 
-	if (*pszFilterMask == '\0') {
-		pszFilterMask = DEFAULT_FILTER_MASK;
-	}
+	/* parse IP-Adress */
+	hints.ai_flags = AI_NUMERICHOST | AI_V4MAPPED;
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = 0;
+	hints.ai_protocol = 0;
+	rv = getaddrinfo(pszAddress, NULL, &hints, &res);
 
-	/* Client IP-Adresse maskieren */
-	rv = apr_ipsubnet_create(&pIPSubNet, pszAddress, pszFilterMask, pPool);
-
-	if (APR_STATUS_IS_EINVAL(rv)) {
-        /* keine IP-Adresse identifiziert (Hostname?) */
-		pszFilteredIP = pszAddress;
-
-    } else if (rv != APR_SUCCESS) {
-		/* Fehler beim Maskieren */
-		pszFilteredIP = pszAddress;
-
-	} else if (pIPSubNet->family != AF_INET) {
-		/* keine IPv4-Adresse */
-		pszFilteredIP = pszFilteredIP;
-
-	} else {
+	if (!rv && res) {
 		/* ok */
-		pszFilteredIP = apr_pcalloc(pPool, sizeof("xxx.xxx.xxx.xxx"));
-		ipmask_inet_ntop4((char*)pIPSubNet->sub, pszFilteredIP);
+		if (*pszFilterMask == '\0') {
+			bitsv4 = DEFAULT_FILTER_BITS_V4;
+			bitsv6 = DEFAULT_FILTER_BITS_V6;
+		} else {
+			char *slash = strchr(pszFilterMask, '/');
+			bitsv4 = atoi(pszFilterMask);
+			bitsv6 = slash ? atoi(slash + 1) : bitsv4;
+		}
+		if (bitsv4 > DEFAULT_FILTER_BITS_V4) { bitsv4 = DEFAULT_FILTER_BITS_V4; }
+		if (bitsv6 > DEFAULT_FILTER_BITS_V6) { bitsv6 = DEFAULT_FILTER_BITS_V6; }
+		if (res->ai_family == AF_INET) {
+			struct sockaddr_in *sin = (struct sockaddr_in *) res->ai_addr;
+			sin->sin_addr.s_addr &= htonl(0xffffffffU << (32-bitsv4));
+			pszFilteredIP = to_string((struct sockaddr *) sin, res->ai_addrlen, pPool);
+		} else if (res->ai_family == AF_INET6) {
+			struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *) res->ai_addr;
+			struct in6_addr *addr = &sin6->sin6_addr;
+			int i;
+			if (addr->s6_addr[0] == 0x20 && addr->s6_addr[1] == 0x02) {
+				bitsv6 = 16 + bitsv4;
+			} else if (!memcmp(addr->s6_addr, V4_PFX, 12)) {
+				bitsv6 = 96 + bitsv4;
+			}
+			for (i = 15; 8*i >= bitsv6; i--) {
+				addr->s6_addr[i] = 0;
+			}
+			if (bitsv6 & 7) {
+				addr->s6_addr[bitsv6 >> 3] &= 0xff << (8 - (bitsv6 & 7));
+			}
+			pszFilteredIP = to_string((struct sockaddr *) sin6, res->ai_addrlen, pPool);
+		}
 	}
+	if (res) { freeaddrinfo(res); }
 
-	return pszFilteredIP;
+	return pszFilteredIP ? pszFilteredIP : pszAddress;
 };
 
 
 /**
- * @brief	Diese Funktion gibt die IP-Adresse des Clients maskiert zurück, wenn
- *			der Hostname nicht aufgelöst wurde
+ * @brief	Diese Funktion gibt die IP-Adresse des Clients maskiert zurueck, wenn
+ *			der Hostname nicht aufgeloest wurde
  *
  * @param	request_rec*	pRequest (request-Struktur)
- * @param	char*			pszMask (Konfigurationsparameter für %h aus httpd.conf)
+ * @param	char*			pszMask (Konfigurationsparameter fuer %h aus httpd.conf)
  */
 static const char *log_remote_host_masked(request_rec* pRequest, char* pszMask) 
 {
@@ -156,10 +166,10 @@ static const char *log_remote_host_masked(request_rec* pRequest, char* pszMask)
 
 
 /**
- * @brief	Diese Funktion gibt die IP-Adresse des Clients maskiert zurück
+ * @brief	Diese Funktion gibt die IP-Adresse des Clients maskiert zurueck
  *
  * @param	request_rec*	pRequest (request-Struktur)
- * @param	char*			pszMask (Konfigurationsparameter für %a aus httpd.conf)
+ * @param	char*			pszMask (Konfigurationsparameter fuer %a aus httpd.conf)
  */
 static const char *log_remote_address_masked(request_rec* pRequest, char* pszMask) 
 {
@@ -177,7 +187,7 @@ static const char *log_remote_address_masked(request_rec* pRequest, char* pszMas
 
 /**
  * @brief	Diese Funktion ersetzt die LogFormat-Direktiven aus mod_log_config.c,
- *			die Client IP-Adressen enthalten können, mit eigenen Handlern
+ *			die Client IP-Adressen enthalten koennen, mit eigenen Handlern
  * 
  * @param	apr_pool_t*	p
  * @param	apr_pool_t*	plog
@@ -198,7 +208,7 @@ static int ipmask_pre_config(apr_pool_t* p, apr_pool_t* plog, apr_pool_t* ptemp)
 
 /**
  * @brief	Diese Callback-Funktion registriert die pre-config-Funktion,
- *			durch die die Handler für die LogFormat-Direktiven ersetzt
+ *			durch die die Handler fuer die LogFormat-Direktiven ersetzt
  *			werden (%a und %h).
  *			Diese pre-config-Funktion muss nach der aus mod_log_config.c 
  *			aufgerufen werden.
@@ -212,9 +222,9 @@ static void ipmask_register_hooks (apr_pool_t* p)
 }
 
 /*
- * Deklaration und Veröffentlichung der Modul-Datenstruktur.
+ * Deklaration und Veroeffentlichung der Modul-Datenstruktur.
  * Der Name dieser Struktur ist wichtig ('log_ipmask_module') - er muss
- * mit dem Namen des Moduls übereinstimmen, da diese Struktur die
+ * mit dem Namen des Moduls uebereinstimmen, da diese Struktur die
  * einzige Verbindung zwischen dem http-Kern und diesem Modul ist.
  */
 module AP_MODULE_DECLARE_DATA log_ipmask_module =
